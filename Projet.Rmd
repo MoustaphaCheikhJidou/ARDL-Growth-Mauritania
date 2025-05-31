@@ -1,0 +1,1420 @@
+---
+title: "Projet Régression (S71)"
+author: "B034159"
+date: "2025-03-11"
+output: 
+  pdf_document:
+    fig_crop: false
+---
+# Chunk d'initialisation knitr
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+## .Library nécessaire
+```{r}
+library(tseries)
+library(tidyverse)
+library(ARDL)
+library(strucchange)
+library(readxl)
+library(MASS)
+library(naniar)
+library(dplyr)
+library(dynlm)
+library(caret)
+library(mice)
+model_formula <- .GlobalEnv
+
+L <- function(x, k = 1) {
+  if (!is.ts(x)) {
+    x <- ts(x)
+  }
+  stats::lag(x, k)
+}
+
+environment(model_formula) <- .GlobalEnv
+```
+## .Chargement et Préparation des Données
+```{r}
+# 2. Vérification de l'existence du fichier Excel
+excel_file <- "projet.xlsx"
+if (!file.exists(excel_file)) {
+  stop(paste("Fichier introuvable :", excel_file))
+}
+
+# 3. Importation de la 1re feuille du fichier Excel sous forme de data.frame
+df <- read_excel(excel_file, sheet = 1)
+df <- as.data.frame(df)
+
+# 4. Renommage des 30 colonnes
+#   Notez que l'ordre doit correspondre exactement à celui du fichier Excel.
+names(df) <- c("annees",                    #  1
+               "consommation_menages",      #  2
+               "consommation_publique",     #  3
+               "variations_stocks",         #  4
+               "formation_brute_capital_fixe", #  5
+               "importations",              #  6
+               "exportations",              #  7
+               "revenu",                    #  8
+               "taux_interet",              #  9
+               "pib",                       # 10
+               "production",                # 11
+               "emploi_gov",               # 12
+               "incert_agricol",            # 13
+               "aide_etr",                  # 14
+               "prix_relatif",              # 15
+               "taux_de_change",            # 16
+               "masse_monnetaire",          # 17
+               "inflation",                 # 18
+               "indice_prix_conso",         # 19
+               "taux_croissance_pib",       # 20
+               "taux_interet_pret",         # 21
+               "taux_interet_depot",        # 22
+               "cie",                       # 23
+               "taux_croissance_humaine",   # 24
+               "taux_croissance",           # 25
+               "deflation",                 # 26
+               "investissement",            # 27
+               "epargne",                   # 28
+               "recette_fiscale",           # 29
+               "depenses_publiques")        # 30
+
+```
+
+### .Nettoyage et traitement des données
+```{r}
+# 1. Conversion en numérique des colonnes (pour gérer les virgules éventuellement présentes)
+numeric_vars <- c("consommation_menages","consommation_publique","variations_stocks",
+                  "formation_brute_capital_fixe","importations","exportations",
+                  "revenu","taux_interet","pib","production","emploi_gov","incert_agricol",
+                  "aide_etr","prix_relatif","taux_de_change","masse_monnetaire","inflation",
+                  "indice_prix_conso","taux_croissance_pib","taux_interet_pret",
+                  "taux_interet_depot","cie","taux_croissance_humaine","taux_croissance",
+                  "deflation","investissement","epargne","recette_fiscale","depenses_publiques")
+
+for(var in numeric_vars) {
+  # Remplacement éventuel de virgules par des points, puis conversion en numérique
+  df[[var]] <- as.numeric(gsub(",", ".", df[[var]]))
+}
+# 2. Vérification de la dimension (n lignes, p colonnes)
+cat("Dimensions du dataframe :", dim(df), "\n")
+# Vous attendez 64 observations et 30 variables, donc : 64 30
+
+# 3. Vérification de la structure et des types de données
+str(df)
+vis_miss(df)
+```
+
+
+## .Analyse et filtrage des variables trop incomplète
+```{r}
+library(dplyr)
+pourcentage_NA <- colMeans(is.na(df)) * 100
+pourcentage_NA
+
+
+# ont décide de retirer TOUTES les variables
+# qui ont plus de 50% de valeurs manquantes
+seuil <- 0.50
+vars_a_retirer <- names(pourcentage_NA)[which(pourcentage_NA > (seuil * 100))]
+
+# Si cette liste est non vide, on retire ces variables :
+if (length(vars_a_retirer) > 0) {
+  message("Variables suivantes retirées pour trop de valeurs manquantes (>50%) : ",
+          paste(vars_a_retirer, collapse = ", "))
+  df <- df %>% dplyr::select(-all_of(vars_a_retirer))
+}
+
+
+```
+
+
+## .Imputation multiple des données manquantes (méthode MICE)
+```{r}
+# ... (étapes A1 à A4 inchangées)
+
+# Préparation de la configuration d'imputation
+method_mice <- rep("pmm", ncol(df))
+names(method_mice) <- names(df)
+if ("annees" %in% names(df)) {
+  method_mice["annees"] <- ""
+}
+if ("consommation_menages" %in% names(df)) {
+  method_mice["consommation_menages"] <- "norm"
+}
+
+predMat <- make.predictorMatrix(df)
+if ("annees" %in% names(df)) {
+  predMat["annees", ] <- 0
+  predMat[, "annees"] <- 0
+}
+
+# Forcer un sous-ensemble de prédicteurs pour "consommation_menages"
+if ("consommation_menages" %in% names(df)) {
+  predMat["consommation_menages", ] <- 0
+  # Choix de variables moins corrélées, par exemple "revenu" et "taux_interet"
+  candidats_ok <- intersect(c("revenu", "taux_interet"), names(df))
+  if (length(candidats_ok) > 0) {
+    predMat["consommation_menages", candidats_ok] <- 1
+  }
+}
+
+# (Optionnel) Standardisation des variables numériques pour améliorer la stabilité numérique
+df_num <- dplyr::select(df, where(is.numeric))
+df[ , names(df_num)] <- as.data.frame(scale(df_num))
+
+# Imputation MICE avec un ridge augmenté
+set.seed(123)
+imp <- mice(
+  data            = df,
+  m               = 5,
+  maxit           = 20,
+  method          = method_mice,
+  predictorMatrix = predMat,
+  ridge           = 1e-1   # Valeur augmentée pour réduire la singularité
+)
+
+df_impute <- complete(imp, 1)
+cat("\n=== Imputation terminée ===\n")
+cat("Dimensions du df_impute :", dim(df_impute), "\n")
+
+
+```
+
+
+## .Analyse des valeurs manquantes
+```{r}
+vis_miss(df_impute)
+
+```
+
+
+# .consommation des ménages  
+
+## .Test de racine unitaire (ADF) - Résultats sous forme de tableau
+```{r}
+
+# Liste des variables à tester
+vars_adf <- c("consommation_menages", "revenu", "incert_agricol", "emploi_gov", "r")
+
+# On ne conserve que les variables existantes dans df_impute et ayant une longueur suffisante (au moins 3 observations pour k = 2)
+vars_adf <- Filter(function(v) {
+  v %in% names(df_impute) && length(df_impute[[v]]) > (2 + 1)
+}, vars_adf)
+
+# Application du test ADF pour chaque variable sélectionnée
+adf_results <- lapply(vars_adf, function(v) {
+  series <- df_impute[[v]]
+  test_res <- adf.test(series, k = 2)  # Vous pouvez ajuster k selon vos besoins
+  data.frame(
+    variable  = v,
+    statistic = test_res$statistic,
+    p_value   = test_res$p.value,
+    method    = test_res$method,
+    row.names = NULL
+  )
+})
+
+# Combinaison des résultats dans un seul data.frame
+adf_table <- do.call(rbind, adf_results)
+print(adf_table)
+
+```
+
+
+## .Choix du retard optimal (AIC) pour le modèle ARDL
+```{r}
+# Sélection automatique du modèle ARDL
+model_select <- auto_ardl(
+  formula   = consommation_menages ~ revenu + incert_agricol + emploi_gov,
+  data      = df_impute,
+  max_order = 4
+)
+
+# Extraction du tableau des top orders retourné par auto_ardl()
+# Ce tableau contient une colonne "AIC" et plusieurs colonnes indiquant les retards pour chaque variable
+top_orders <- model_select$top_orders
+
+# Combiner toutes les colonnes de retard (celles autres que "AIC") en une chaîne de caractères
+lag_combination <- apply(top_orders[, setdiff(names(top_orders), "AIC")], 1, paste, collapse = ", ")
+
+# Créer un nouveau data frame ne contenant que la colonne AIC et la colonne "Lag" qui résume les retards
+result_table <- data.frame(AIC = top_orders$AIC, Lag = as.vector(top_orders))
+
+# Afficher le tableau final
+result_table
+
+
+```
+
+
+## .Estimation du modèle ARDL (en utilisant les retards optimaux trouvés)
+
+```{r}
+# On utilise ardl() en spécifiant la même formule et l'ordre optimal :
+best_order <- model_select$best_order
+model_ardl <- ardl(
+  formula = consommation_menages ~ revenu + incert_agricol + emploi_gov ,
+  data    = df_impute,
+  order   = best_order
+)
+
+# Résumé du modèle estimé => renvoie un objet "summary.ardl"
+# Pour un tableau clair, on transforme la partie coefficients en data.frame
+ardl_summary <- summary(model_ardl)
+estimation_table <- as.data.frame(ardl_summary$coefficients)
+estimation_table
+
+```
+
+### .Test de Bounds (Pesaran, Shin, Smith) - Résultats sous forme de tableau
+```{r}
+# Exécution du test de bounds avec case = 3 (Intercept non restreint, sans tendance)
+# On spécifie alpha = 0.05 pour obtenir les bornes critiques asymptotiques
+bounds_test <- bounds_f_test(model_ardl, case = 3, alpha = 0.05)
+
+# Si les valeurs critiques ne sont pas fournies, on assigne manuellement des valeurs issues de Pesaran et al. (2001)
+if (is.null(bounds_test$critical_values)) {
+  
+  # Valeurs critiques manuelles pour alpha = 0.05 (à adapter selon votre modèle)
+  crit_lower_5 <- 2.79  # borne inférieure I(0)
+  crit_upper_5 <- 3.67  # borne supérieure I(1)
+  
+} else {
+  
+  # Extraction des bornes critiques pour le niveau alpha = 0.05
+  crit_lower_5 <- bounds_test$critical_values[3, 1]
+  crit_upper_5 <- bounds_test$critical_values[3, 2]
+}
+
+# Récupération de la F-statistic
+f_stat <- bounds_test$statistic
+
+# Comparaison de la F-statistic avec les bornes critiques (pour alpha = 0.05)
+comparison <- if (f_stat < crit_lower_5) {
+  paste("F (", round(f_stat, 2), ") est inférieur à la borne I(0) (", crit_lower_5, 
+        "): pas de co-intégration", sep = "")
+} else if (f_stat > crit_upper_5) {
+  paste("F (", round(f_stat, 2), ") est supérieur à la borne I(1) (", crit_upper_5, 
+        "): co-intégration établie", sep = "")
+} else {
+  paste("F (", round(f_stat, 2), ") est entre la borne I(0) (", crit_lower_5, 
+        ") et la borne I(1) (", crit_upper_5, "): résultat incertain", sep = "")
+}
+
+# Création d'un DataFrame regroupant la F-statistic, les bornes critiques et le résultat de la comparaison
+bounds_table_one <- data.frame(
+  Parameter = c("F_statistic", "Crit. Val (5%) - I(0)", "Crit. Val (5%) - I(1)", "Conclusion"),
+  Value = c(f_stat, crit_lower_5, crit_upper_5, comparison)
+)
+
+# Affichage du tableau
+print(bounds_table_one)
+
+
+
+
+
+```
+
+## .Test de normalité des résidus (Jarque-Bera) - Tableau
+```{r}
+
+# Extraction des résidus du modèle ARDL
+residus <- residuals(model_ardl)
+
+# Jarque-Bera test via tseries
+jb_test <- jarque.bera.test(residus)
+
+# Tableau
+jb_table <- data.frame(
+  JB_Statistic = jb_test$statistic,
+  p_value      = jb_test$p.value
+)
+jb_table
+
+
+```
+
+### .Test de stabilité (CUSUM et CUSUM of Squares) - Tableau
+```{r}
+# Charger le package nécessaire pour les tests de stabilité
+library(strucchange)
+
+# Récupération robuste de la formule du modèle ARDL
+if (!is.null(model_ardl$lm)) {
+  model_formula <- formula(model_ardl$lm)
+} else if (!is.null(model_ardl$full_formula)) {
+  model_formula <- model_ardl$full_formula
+} else if (!is.null(model_ardl$call$formula)) {
+  model_formula <- model_ardl$call$formula
+} else {
+  stop("Impossible de récupérer la formule du modèle ARDL.")
+}
+
+
+# Pour s'assurer que la formule trouve bien toutes les fonctions nécessaires,
+# on lui assigne l'environnement global
+environment(model_formula) <- .GlobalEnv
+
+# Application du test de stabilité : CUSUM (Rec-CUSUM)
+cusum_test_obj <- efp(model_formula, data = df, type = "Rec-CUSUM")
+cusum_test_res <- sctest(cusum_test_obj)
+
+# Application d'un test alternatif pour les carrés :
+# Ici, on utilise "Rec-MOSUM" qui est une option autorisée (remplaçant "Rec-CUSUM2")
+cusum_sq_test_obj <- efp(model_formula, data = df, type = "Rec-MOSUM")
+cusum_sq_test_res <- sctest(cusum_sq_test_obj)
+
+# Rassembler les résultats dans un DataFrame
+stability_table <- data.frame(
+  Test      = c("CUSUM", "Rec-MOSUM"),
+  Statistic = c(cusum_test_res$statistic, cusum_sq_test_res$statistic),
+  p_value   = c(cusum_test_res$p.value,   cusum_sq_test_res$p.value)
+)
+
+# Afficher le tableau des résultats de stabilité
+print(stability_table)
+
+
+```
+# .Consommation publique  
+
+## .Test de racine unitaire (ADF) - Résultats sous forme de tableau
+```{r}
+# BLOC 1 : TEST ADF
+
+# 1. Liste des variables à tester : la variable dépendante + variables explicatives
+vars_adf <- c("consommation_publique", "aide_etr", "r", "taux_croissance")
+
+# 2. On ne conserve que celles qui existent dans df_impute et ont au moins 3 observations (pour k=2)
+vars_adf <- Filter(function(v) {
+  v %in% names(df_impute) && length(df_impute[[v]]) > 3
+}, vars_adf)
+
+# 3. Application du test ADF à chaque variable sélectionnée
+adf_results <- lapply(vars_adf, function(var_name) {
+  series <- df_impute[[var_name]]
+  test_res <- adf.test(series, k = 2)  # Ajustez k si nécessaire
+  data.frame(
+    variable  = var_name,
+    statistic = test_res$statistic,
+    p_value   = test_res$p.value,
+    method    = test_res$method,
+    row.names = NULL
+  )
+})
+
+# 4. Combinaison des résultats en un seul data frame
+adf_table <- do.call(rbind, adf_results)
+
+# 5. Affichage du tableau ADF
+cat("===== Tableau ADF =====\n")
+print(adf_table)
+
+```
+
+
+## .Choix du retard optimal (AIC) pour le modèle ARDL
+```{r}
+# BLOC 2 : CHOIX DU RETARD OPTIMAL ARDL
+
+# 1. Création de la formule ARDL : consommation_publique en dépendante
+#    et (aide_etr, r, taux_croissance) en explicatives
+ardl_formula <- consommation_publique ~ aide_etr  + taux_croissance
+
+# 2. Sélection automatique du modèle ARDL (max_order = 4, critère = AIC par défaut)
+model_select <- auto_ardl(
+  formula   = ardl_formula,
+  data      = df_impute,
+  max_order = 4
+)
+
+# 3. Récupération du tableau des "top_orders" (avec AIC et combinaisons de retards)
+top_orders <- model_select$top_orders
+
+# 4. Combiner les colonnes de retard en une chaîne (sauf la colonne AIC)
+if (!is.null(top_orders)) {
+  lag_combination <- apply(top_orders[, setdiff(names(top_orders), "AIC")], 1, paste, collapse = ", ")
+  result_table <- data.frame(AIC = top_orders$AIC, Lag = lag_combination)
+  
+  cat("\n===== Tableau de sélection des retards (AIC et Lag) =====\n")
+  print(result_table)
+} else {
+  cat("Aucune information de retards disponible.\n")
+}
+
+# 5. Récupération de la meilleure combinaison de retards
+best_order <- model_select$best_order
+
+# 6. Si le premier élément est NULL (intercept), on le retire
+if (length(best_order) > 0 && is.null(best_order[[1]])) {
+  best_order <- best_order[-1]
+}
+
+```
+
+## .Estimation du modèle ARDL (en utilisant les retards optimaux trouvés)
+
+```{r}
+# BLOC 3 : ESTIMATION ARDL
+
+# 1. Estimation du modèle ARDL avec la meilleure combinaison de retards
+model_ardl <- ardl(
+  formula = ardl_formula,
+  data    = df_impute,
+  order   = best_order
+)
+
+# 2. Récupération d'un résumé et extraction des coefficients
+ardl_summary <- summary(model_ardl)
+estimation_table <- as.data.frame(ardl_summary$coefficients)
+
+# 3. Affichage du tableau des coefficients
+cat("\n===== Tableau des coefficients du modèle ARDL =====\n")
+print(estimation_table)
+
+
+```
+
+## .Test de Bounds (Pesaran, Shin, Smith) - Résultats sous forme de tableau
+```{r}
+# BLOC 4 : TEST DE BOUNDS
+
+# 1. Exécution du test de Bounds : case = 3 (Intercept non restreint, pas de tendance)
+#    alpha = 0.05 pour avoir des bornes critiques asymptotiques
+bounds_test <- bounds_f_test(model_ardl, case = 3, alpha = 0.05)
+
+# 2. Si les valeurs critiques ne sont pas fournies, on les assigne manuellement
+if (is.null(bounds_test$critical_values)) {
+  crit_lower_5 <- 2.79  # Borne I(0) à 5%
+  crit_upper_5 <- 3.67  # Borne I(1) à 5%
+} else {
+  crit_lower_5 <- bounds_test$critical_values[3, 1]
+  crit_upper_5 <- bounds_test$critical_values[3, 2]
+}
+
+# 3. Comparaison de la statistique F aux bornes I(0) et I(1)
+f_stat <- bounds_test$statistic
+comparison <- if (f_stat < crit_lower_5) {
+  paste("F (", round(f_stat, 2), ") < I(0) (", crit_lower_5, "): pas de co-intégration", sep = "")
+} else if (f_stat > crit_upper_5) {
+  paste("F (", round(f_stat, 2), ") > I(1) (", crit_upper_5, "): co-intégration établie", sep = "")
+} else {
+  paste("F (", round(f_stat, 2), ") est entre I(0) (", crit_lower_5, ") et I(1) (", crit_upper_5, "): résultat incertain", sep = "")
+}
+
+# 4. Création du tableau de résultats
+bounds_table <- data.frame(
+  Parameter = c("F_statistic", "Crit. Val (5%) - I(0)", "Crit. Val (5%) - I(1)", "Conclusion"),
+  Value     = c(f_stat, crit_lower_5, crit_upper_5, comparison)
+)
+
+# 5. Affichage
+cat("\n===== Tableau du test de Bounds =====\n")
+print(bounds_table)
+
+
+```
+
+## .Test de normalité des résidus (Jarque-Bera) - Tableau
+```{r}
+
+# BLOC 5 : TEST JARQUE-BERA
+
+# 1. Extraction des résidus du modèle ARDL
+residus <- residuals(model_ardl)
+
+# 2. Test de Jarque-Bera (via tseries)
+jb_test <- jarque.bera.test(residus)
+
+# 3. Tableau contenant la statistique JB et la p-value
+jb_table <- data.frame(
+  JB_Statistic = jb_test$statistic,
+  p_value      = jb_test$p.value
+)
+
+# 4. Affichage
+cat("\n===== Tableau du test de normalité (Jarque-Bera) =====\n")
+print(jb_table)
+
+
+
+```
+
+### .Test de stabilité (CUSUM et CUSUM of Squares) - Tableau
+```{r}
+# BLOC 6 : TEST DE STABILITÉ
+
+# 1. Récupération de la formule "linéaire" stockée dans le modèle ARDL
+if (!is.null(model_ardl$lm)) {
+  model_formula <- formula(model_ardl$lm)
+} else if (!is.null(model_ardl$full_formula)) {
+  model_formula <- model_ardl$full_formula
+} else if (!is.null(model_ardl$call$formula)) {
+  model_formula <- model_ardl$call$formula
+} else {
+  stop("Impossible de récupérer la formule du modèle ARDL.")
+}
+
+# 2. Assigner l'environnement global si nécessaire (pour éviter les problèmes de fonction L)
+environment(model_formula) <- .GlobalEnv
+
+# 3. Test CUSUM (Rec-CUSUM)
+cusum_test_obj <- efp(model_formula, data = df_impute, type = "Rec-CUSUM")
+cusum_test_res <- sctest(cusum_test_obj)
+
+# 4. Test Rec-MOSUM (alternatif au CUSUM of Squares)
+cusum_sq_test_obj <- efp(model_formula, data = df_impute, type = "Rec-MOSUM")
+cusum_sq_test_res <- sctest(cusum_sq_test_obj)
+
+# 5. Compilation des résultats
+stability_table <- data.frame(
+  Test      = c("CUSUM", "Rec-MOSUM"),
+  Statistic = c(cusum_test_res$statistic, cusum_sq_test_res$statistic),
+  p_value   = c(cusum_test_res$p.value,   cusum_sq_test_res$p.value)
+)
+
+# 6. Affichage
+cat("\n===== Tableau des tests de stabilité =====\n")
+print(stability_table)
+
+
+
+```
+# .Variation des stocks
+
+## .Test de racine unitaire (ADF) - Résultats sous forme de tableau
+```{r}
+###############################################################################
+## BLOC 1 : TEST DE RACINE UNITAIRE (ADF)
+###############################################################################
+
+# 1. Liste des variables à tester : la variable dépendante + variables explicatives
+vars_adf <- c("variations_stocks", "production", "r")
+
+# 2. On ne conserve que celles qui existent dans df_impute et ont au moins 3 observations (pour k=2)
+vars_adf <- Filter(function(v) {
+  v %in% names(df_impute) && length(df_impute[[v]]) > 3
+}, vars_adf)
+
+# 3. Application du test ADF pour chaque variable sélectionnée
+adf_results <- lapply(vars_adf, function(var_name) {
+  series <- df_impute[[var_name]]
+  test_res <- adf.test(series, k = 2)  # Ajustez k au besoin
+  data.frame(
+    variable  = var_name,
+    statistic = test_res$statistic,
+    p_value   = test_res$p.value,
+    method    = test_res$method,
+    row.names = NULL
+  )
+})
+
+# 4. Combinaison des résultats en un seul data.frame
+adf_table <- do.call(rbind, adf_results)
+
+# 5. Affichage du tableau ADF
+cat("===== Tableau ADF =====\n")
+print(adf_table)
+
+
+```
+
+
+## .Choix du retard optimal (AIC) pour le modèle ARDL
+```{r}
+###############################################################################
+## BLOC 2 : CHOIX DU RETARD OPTIMAL (AIC) POUR LE MODÈLE ARDL
+###############################################################################
+
+# 1. Création de la formule ARDL : variations_stocks dépendante et (production, r) en explicatives
+ardl_formula <- variations_stocks ~ production
+
+# 2. Sélection automatique du modèle ARDL (max_order = 4, critère = AIC par défaut)
+model_select <- auto_ardl(
+  formula   = ardl_formula,
+  data      = df_impute,
+  max_order = 4
+)
+
+# 3. Récupération du tableau "top_orders" avec AIC et combinaisons de retards
+top_orders <- model_select$top_orders
+
+# 4. Combiner les colonnes de retard (sauf "AIC") en une chaîne pour un aperçu
+if (!is.null(top_orders)) {
+  lag_combination <- apply(top_orders[, setdiff(names(top_orders), "AIC")], 1, paste, collapse = ", ")
+  result_table <- data.frame(AIC = top_orders$AIC, Lag = lag_combination)
+  
+  cat("\n===== Tableau de sélection des retards (AIC et Lag) =====\n")
+  print(result_table)
+} else {
+  cat("Aucune information de retards disponible.\n")
+}
+
+# 5. Récupération de la meilleure combinaison de retards
+best_order <- model_select$best_order
+
+# 6. Si le premier élément est NULL (intercept), on le retire (pour éviter les erreurs)
+if (length(best_order) > 0 && is.null(best_order[[1]])) {
+  best_order <- best_order[-1]
+}
+
+
+```
+
+## .Estimation du modèle ARDL (en utilisant les retards optimaux trouvés)
+
+```{r}
+###############################################################################
+## BLOC 3 : ESTIMATION ARDL
+###############################################################################
+
+# 1. Estimation du modèle ARDL avec la meilleure combinaison de retards
+model_ardl <- ardl(
+  formula = ardl_formula,
+  data    = df_impute,
+  order   = best_order
+)
+
+# 2. Résumé du modèle et extraction des coefficients sous forme de data.frame
+ardl_summary <- summary(model_ardl)
+estimation_table <- as.data.frame(ardl_summary$coefficients)
+
+# 3. Affichage du tableau des coefficients
+cat("\n===== Tableau des coefficients du modèle ARDL =====\n")
+print(estimation_table)
+
+
+
+```
+
+## .Test de Bounds (Pesaran, Shin, Smith) - Résultats sous forme de tableau
+```{r}
+###############################################################################
+## BLOC 4 : TEST DE BOUNDS (PESARAN, SHIN, SMITH)
+###############################################################################
+
+# 1. Test de Bounds : case = 3 (Intercept non restreint), alpha = 0.05
+bounds_test <- bounds_f_test(model_ardl, case = 3, alpha = 0.05)
+
+# 2. Vérification si les bornes critiques sont fournies
+if (is.null(bounds_test$critical_values)) {
+  crit_lower_5 <- 2.79  # Borne I(0) à 5%
+  crit_upper_5 <- 3.67  # Borne I(1) à 5%
+} else {
+  crit_lower_5 <- bounds_test$critical_values[3, 1]
+  crit_upper_5 <- bounds_test$critical_values[3, 2]
+}
+
+# 3. Comparaison de la statistique F aux bornes
+f_stat <- bounds_test$statistic
+comparison <- if (f_stat < crit_lower_5) {
+  paste("F (", round(f_stat, 2), ") < I(0) (", crit_lower_5, "): pas de co-intégration", sep = "")
+} else if (f_stat > crit_upper_5) {
+  paste("F (", round(f_stat, 2), ") > I(1) (", crit_upper_5, "): co-intégration établie", sep = "")
+} else {
+  paste("F (", round(f_stat, 2), ") entre I(0) (", crit_lower_5, ") et I(1) (", crit_upper_5, "): résultat incertain", sep = "")
+}
+
+# 4. Tableau de résultats
+bounds_table <- data.frame(
+  Parameter = c("F_statistic", "Crit. Val (5%) - I(0)", "Crit. Val (5%) - I(1)", "Conclusion"),
+  Value     = c(f_stat, crit_lower_5, crit_upper_5, comparison)
+)
+
+# 5. Affichage
+cat("\n===== Tableau du test de Bounds =====\n")
+print(bounds_table)
+
+
+
+
+```
+
+## .Test de normalité des résidus (Jarque-Bera) - Tableau
+```{r}
+
+###############################################################################
+## BLOC 5 : TEST DE NORMALITÉ (JARQUE-BERA)
+###############################################################################
+
+# 1. Extraction des résidus du modèle ARDL
+residus <- residuals(model_ardl)
+
+# 2. Test de Jarque-Bera
+jb_test <- jarque.bera.test(residus)
+
+# 3. Création du tableau
+jb_table <- data.frame(
+  JB_Statistic = jb_test$statistic,
+  p_value      = jb_test$p.value
+)
+
+# 4. Affichage
+cat("\n===== Tableau du test de normalité (Jarque-Bera) =====\n")
+print(jb_table)
+
+
+
+
+```
+
+## .Test de stabilité (CUSUM et CUSUM of Squares) - Tableau
+```{r}
+###############################################################################
+## BLOC 6 : TEST DE STABILITÉ (CUSUM ET REC-MOSUM)
+###############################################################################
+
+# 1. Récupération de la formule "lm" depuis le modèle ARDL
+if (!is.null(model_ardl$lm)) {
+  model_formula <- formula(model_ardl$lm)
+} else if (!is.null(model_ardl$full_formula)) {
+  model_formula <- model_ardl$full_formula
+} else if (!is.null(model_ardl$call$formula)) {
+  model_formula <- model_ardl$call$formula
+} else {
+  stop("Impossible de récupérer la formule du modèle ARDL.")
+}
+
+# 2. Assurer que l'environnement de la formule est correct (pour éviter les erreurs de fonction L)
+environment(model_formula) <- .GlobalEnv
+
+# 3. Test CUSUM (Rec-CUSUM)
+cusum_test_obj <- efp(model_formula, data = df_impute, type = "Rec-CUSUM")
+cusum_test_res <- sctest(cusum_test_obj)
+
+# 4. Test Rec-MOSUM (en remplacement du CUSUM of Squares)
+cusum_sq_test_obj <- efp(model_formula, data = df_impute, type = "Rec-MOSUM")
+cusum_sq_test_res <- sctest(cusum_sq_test_obj)
+
+# 5. Compilation des résultats
+stability_table <- data.frame(
+  Test      = c("CUSUM", "Rec-MOSUM"),
+  Statistic = c(cusum_test_res$statistic, cusum_sq_test_res$statistic),
+  p_value   = c(cusum_test_res$p.value,   cusum_sq_test_res$p.value)
+)
+
+# 6. Affichage
+cat("\n===== Tableau des tests de stabilité =====\n")
+print(stability_table)
+
+
+
+
+```
+
+
+# .Formation brute de capital fixe  
+
+## .Test de racine unitaire (ADF) - Résultats sous forme de tableau
+```{r}
+# ---- BLOC 1 : Test de racine unitaire (ADF) ----
+
+# On définit la liste des variables à tester : dépendante et explicatives
+vars_adf <- c("formation_brute_capital_fixe", "revenu", "taux_interet", "deflation")
+
+# On conserve uniquement les variables existantes dans df_impute et ayant au moins 3 observations
+vars_adf <- Filter(function(v) {
+  v %in% names(df_impute) && length(df_impute[[v]]) > 3
+}, vars_adf)
+
+# Application du test ADF pour chacune des variables
+adf_results <- lapply(vars_adf, function(var_name) {
+  series <- df_impute[[var_name]]
+  test_res <- adf.test(series, k = 2)  # Ajustez k si nécessaire
+  data.frame(
+    variable  = var_name,
+    statistic = test_res$statistic,
+    p_value   = test_res$p.value,
+    method    = test_res$method,
+    row.names = NULL
+  )
+})
+
+# Combinaison des résultats dans un seul data frame
+adf_table <- do.call(rbind, adf_results)
+
+cat("===== Tableau ADF =====\n")
+print(adf_table)
+
+
+
+```
+
+
+## .Choix du retard optimal (AIC) pour le modèle ARDL
+```{r}
+# ---- BLOC 2 : Choix du retard optimal (AIC) ----
+
+# Création de la formule ARDL pour Formation brute de capital fixe
+# avec comme explicatives : revenu, taux_interet et inflation
+ardl_formula <- formation_brute_capital_fixe ~ revenu + taux_interet + deflation
+
+# Sélection automatique du modèle ARDL
+model_select <- auto_ardl(
+  formula   = ardl_formula,
+  data      = df_impute,
+  max_order = 4
+)
+
+# Extraction du tableau des top orders (qui contient la valeur AIC et les retards pour chaque variable)
+top_orders <- model_select$top_orders
+
+# Combiner les colonnes de retard (toutes sauf "AIC") en une chaîne
+if (!is.null(top_orders)) {
+  lag_combination <- apply(top_orders[, setdiff(names(top_orders), "AIC")], 1, paste, collapse = ", ")
+  result_table <- data.frame(AIC = top_orders$AIC, Lag = lag_combination)
+  
+  cat("\n===== Tableau de sélection des retards (AIC et Lag) =====\n")
+  print(result_table)
+} else {
+  cat("Aucune information de retards disponible.\n")
+}
+
+# Récupération de la meilleure combinaison de retards
+best_order <- model_select$best_order
+if (length(best_order) > 0 && is.null(best_order[[1]])) {
+  best_order <- best_order[-1]
+}
+
+
+```
+
+## .Estimation du modèle ARDL (en utilisant les retards optimaux trouvés)
+
+```{r}
+# BLOC 3 : ESTIMATION ARDL
+
+# 1. Estimation du modèle ARDL avec la meilleure combinaison de retards
+model_ardl <- ardl(
+  formula = ardl_formula,
+  data    = df_impute,
+  order   = best_order
+)
+
+# 2. Récupération d'un résumé et extraction des coefficients
+ardl_summary <- summary(model_ardl)
+estimation_table <- as.data.frame(ardl_summary$coefficients)
+
+# 3. Affichage du tableau des coefficients
+cat("\n===== Tableau des coefficients du modèle ARDL =====\n")
+print(estimation_table)
+
+
+```
+
+## .Test de Bounds (Pesaran, Shin, Smith) - Résultats sous forme de tableau
+```{r}
+# ---- BLOC 4 : Test de Bounds ----
+
+# Exécution du test de Bounds avec case = 3 (Intercept non restreint, sans tendance)
+# et alpha = 0.05 pour obtenir les bornes critiques asymptotiques
+bounds_test <- bounds_f_test(model_ardl, case = 3, alpha = 0.05)
+
+# Si les valeurs critiques ne sont pas fournies, on assigne manuellement celles issues de la littérature
+if (is.null(bounds_test$critical_values)) {
+  crit_lower_5 <- 2.79  # Borne I(0) à 5%
+  crit_upper_5 <- 3.67  # Borne I(1) à 5%
+} else {
+  crit_lower_5 <- bounds_test$critical_values[3, 1]
+  crit_upper_5 <- bounds_test$critical_values[3, 2]
+}
+
+# Récupération de la F-statistic
+f_stat <- bounds_test$statistic
+
+# Comparaison de la F-statistic aux bornes critiques
+comparison <- if (f_stat < crit_lower_5) {
+  paste("F (", round(f_stat, 2), ") < I(0) (", crit_lower_5, "): pas de co-intégration", sep = "")
+} else if (f_stat > crit_upper_5) {
+  paste("F (", round(f_stat, 2), ") > I(1) (", crit_upper_5, "): co-intégration établie", sep = "")
+} else {
+  paste("F (", round(f_stat, 2), ") entre I(0) (", crit_lower_5, ") et I(1) (", crit_upper_5, "): résultat incertain", sep = "")
+}
+
+# Création du tableau de résultats du test de Bounds
+bounds_table <- data.frame(
+  Parameter = c("F_statistic", "Crit. Val (5%) - I(0)", "Crit. Val (5%) - I(1)", "Conclusion"),
+  Value     = c(f_stat, crit_lower_5, crit_upper_5, comparison)
+)
+
+cat("\n===== Tableau du test de Bounds =====\n")
+print(bounds_table)
+
+
+
+```
+
+## .Test de normalité des résidus (Jarque-Bera) - Tableau
+```{r}
+
+# ---- BLOC 5 : Test de normalité (Jarque-Bera) ----
+
+# Extraction des résidus du modèle ARDL
+residus <- residuals(model_ardl)
+
+# Réalisation du test Jarque-Bera (via tseries)
+jb_test <- jarque.bera.test(residus)
+
+# Tableau récapitulatif du test
+jb_table <- data.frame(
+  JB_Statistic = jb_test$statistic,
+  p_value      = jb_test$p.value
+)
+
+cat("\n===== Tableau du test de normalité (Jarque-Bera) =====\n")
+print(jb_table)
+
+```
+
+## .Test de stabilité (CUSUM et CUSUM of Squares) - Tableau
+```{r}
+# ---- BLOC 6 : Test de stabilité (CUSUM et Rec-MOSUM) ----
+
+# Récupération de la formule "linéaire" du modèle ARDL
+if (!is.null(model_ardl$lm)) {
+  model_formula <- formula(model_ardl$lm)
+} else if (!is.null(model_ardl$full_formula)) {
+  model_formula <- model_ardl$full_formula
+} else if (!is.null(model_ardl$call$formula)) {
+  model_formula <- model_ardl$call$formula
+} else {
+  stop("Impossible de récupérer la formule du modèle ARDL.")
+}
+
+# Assurer que l'environnement de la formule est correct
+environment(model_formula) <- .GlobalEnv
+
+# Test de stabilité CUSUM (Rec-CUSUM)
+cusum_test_obj <- efp(model_formula, data = df_impute, type = "Rec-CUSUM")
+cusum_test_res <- sctest(cusum_test_obj)
+
+# Test de stabilité Rec-MOSUM (en remplacement de Rec-CUSUM2)
+cusum_sq_test_obj <- efp(model_formula, data = df_impute, type = "Rec-MOSUM")
+cusum_sq_test_res <- sctest(cusum_sq_test_obj)
+
+# Compilation des résultats dans un tableau
+stability_table <- data.frame(
+  Test      = c("CUSUM", "Rec-MOSUM"),
+  Statistic = c(cusum_test_res$statistic, cusum_sq_test_res$statistic),
+  p_value   = c(cusum_test_res$p.value,   cusum_sq_test_res$p.value)
+)
+
+cat("\n===== Tableau des tests de stabilité =====\n")
+print(stability_table)
+
+
+
+
+```
+
+# .Importations 
+
+## .Test de racine unitaire (ADF) - Résultats sous forme de tableau
+```{r}
+# ---- Bloc 1 : Test ADF ----
+
+# Liste des variables à tester
+vars_adf <- c("importations", "revenu", "taux_de_change", "prix_relatif", "variations_stocks")
+
+# Conserver uniquement celles présentes dans df_impute et avec suffisamment d'observations
+vars_adf <- Filter(function(v) {
+  v %in% names(df_impute) && length(df_impute[[v]]) > 3
+}, vars_adf)
+
+# Application du test ADF pour chaque variable
+adf_results <- lapply(vars_adf, function(var_name) {
+  series <- df_impute[[var_name]]
+  test_res <- adf.test(series, k = 2)  # Ajustez k si nécessaire
+  data.frame(
+    variable  = var_name,
+    statistic = test_res$statistic,
+    p_value   = test_res$p.value,
+    method    = test_res$method,
+    row.names = NULL
+  )
+})
+
+# Combiner les résultats dans un data.frame
+adf_table <- do.call(rbind, adf_results)
+
+cat("===== Tableau ADF =====\n")
+print(adf_table)
+
+
+```
+
+
+## .Choix du retard optimal (AIC) pour le modèle ARDL
+```{r}
+# ---- Bloc 2 : Sélection du retard optimal ----
+
+# Création de la formule ARDL : importations en dépendante et 
+# revenu, taux_de_change, prix_relatif, variations_stocks en explicatives
+ardl_formula <- importations ~ revenu + taux_de_change + prix_relatif + variations_stocks
+
+# Sélection automatique du modèle ARDL (max_order = 4)
+model_select <- auto_ardl(
+  formula   = ardl_formula,
+  data      = df_impute,
+  max_order = 4
+)
+
+# Extraction du tableau des top orders (contenant la valeur AIC et les retards)
+top_orders <- model_select$top_orders
+
+# Combiner toutes les colonnes de retard (autres que "AIC") en une chaîne de caractères
+if (!is.null(top_orders)) {
+  lag_combination <- apply(top_orders[, setdiff(names(top_orders), "AIC")], 1, paste, collapse = ", ")
+  result_table <- data.frame(AIC = top_orders$AIC, Lag = lag_combination)
+  
+  cat("\n===== Tableau de sélection des retards (AIC et Lag) =====\n")
+  print(result_table)
+} else {
+  cat("Aucune information de retards disponible.\n")
+}
+
+# Récupération de la meilleure combinaison de retards
+best_order <- model_select$best_order
+if (length(best_order) > 0 && is.null(best_order[[1]])) {
+  best_order <- best_order[-1]
+}
+
+
+```
+
+## .Estimation du modèle ARDL (en utilisant les retards optimaux trouvés)
+
+```{r}
+# ---- Bloc 3 : Estimation du modèle ARDL ----
+
+# Estimation du modèle ARDL avec la formule et la meilleure combinaison de retards
+model_ardl <- ardl(
+  formula = ardl_formula,
+  data    = df_impute,
+  order   = best_order
+)
+
+# Récupération du résumé du modèle et extraction des coefficients sous forme de data.frame
+ardl_summary <- summary(model_ardl)
+estimation_table <- as.data.frame(ardl_summary$coefficients)
+
+cat("\n===== Tableau des coefficients du modèle ARDL =====\n")
+print(estimation_table)
+
+
+
+```
+
+## .Test de Bounds (Pesaran, Shin, Smith) - Résultats sous forme de tableau
+```{r}
+# ---- Bloc 4 : Test de Bounds ----
+
+# Exécution du test de bounds avec case = 3 (Intercept non restreint, sans tendance)
+# et alpha = 0.05 pour obtenir les bornes critiques asymptotiques
+bounds_test <- bounds_f_test(model_ardl, case = 3, alpha = 0.05)
+
+# Si les bornes critiques ne sont pas fournies, on les attribue manuellement
+if (is.null(bounds_test$critical_values)) {
+  crit_lower_5 <- 2.79  # borne inférieure I(0) à 5%
+  crit_upper_5 <- 3.67  # borne supérieure I(1) à 5%
+} else {
+  crit_lower_5 <- bounds_test$critical_values[3, 1]
+  crit_upper_5 <- bounds_test$critical_values[3, 2]
+}
+
+# Récupération de la F-statistic
+f_stat <- bounds_test$statistic
+
+# Comparaison de la F-statistic avec les bornes critiques
+comparison <- if (f_stat < crit_lower_5) {
+  paste("F (", round(f_stat, 2), ") < I(0) (", crit_lower_5, "): pas de co-intégration", sep = "")
+} else if (f_stat > crit_upper_5) {
+  paste("F (", round(f_stat, 2), ") > I(1) (", crit_upper_5, "): co-intégration établie", sep = "")
+} else {
+  paste("F (", round(f_stat, 2), ") entre I(0) (", crit_lower_5, ") et I(1) (", crit_upper_5, "): résultat incertain", sep = "")
+}
+
+# Création du tableau des résultats du test de Bounds
+bounds_table <- data.frame(
+  Parameter = c("F_statistic", "Crit. Val (5%) - I(0)", "Crit. Val (5%) - I(1)", "Conclusion"),
+  Value     = c(f_stat, crit_lower_5, crit_upper_5, comparison)
+)
+
+cat("\n===== Tableau du test de Bounds =====\n")
+print(bounds_table)
+
+
+
+```
+
+## .Test de normalité des résidus (Jarque-Bera) - Tableau
+```{r}
+# ---- Bloc 5 : Test de normalité (Jarque-Bera) ----
+
+# Extraction des résidus du modèle ARDL
+residus <- residuals(model_ardl)
+
+# Réalisation du test Jarque-Bera
+jb_test <- jarque.bera.test(residus)
+
+# Création du tableau récapitulatif
+jb_table <- data.frame(
+  JB_Statistic = jb_test$statistic,
+  p_value      = jb_test$p.value
+)
+
+cat("\n===== Tableau du test de normalité (Jarque-Bera) =====\n")
+print(jb_table)
+
+
+```
+
+## .Test de stabilité (CUSUM et CUSUM of Squares) - Tableau
+```{r}
+# ---- Bloc 6 : Test de stabilité (CUSUM et Rec-MOSUM) ----
+
+# Récupération de la formule linéaire du modèle ARDL (stocké dans model_ardl$lm, sinon full_formula)
+if (!is.null(model_ardl$lm)) {
+  model_formula <- formula(model_ardl$lm)
+} else if (!is.null(model_ardl$full_formula)) {
+  model_formula <- model_ardl$full_formula
+} else if (!is.null(model_ardl$call$formula)) {
+  model_formula <- model_ardl$call$formula
+} else {
+  stop("Impossible de récupérer la formule du modèle ARDL.")
+}
+
+# S'assurer que l'environnement de la formule est l'environnement global
+environment(model_formula) <- .GlobalEnv
+
+# Test de stabilité : CUSUM (Rec-CUSUM)
+cusum_test_obj <- efp(model_formula, data = df_impute, type = "Rec-CUSUM")
+cusum_test_res <- sctest(cusum_test_obj)
+
+# Test de stabilité : Rec-MOSUM (en remplacement de Rec-CUSUM2)
+cusum_sq_test_obj <- efp(model_formula, data = df_impute, type = "Rec-MOSUM")
+cusum_sq_test_res <- sctest(cusum_sq_test_obj)
+
+# Compilation des résultats dans un tableau
+stability_table <- data.frame(
+  Test      = c("CUSUM", "Rec-MOSUM"),
+  Statistic = c(cusum_test_res$statistic, cusum_sq_test_res$statistic),
+  p_value   = c(cusum_test_res$p.value,   cusum_sq_test_res$p.value)
+)
+
+cat("\n===== Tableau des tests de stabilité =====\n")
+print(stability_table)
+
+```
+
+# .Exportations 
+
+## .Test de racine unitaire (ADF) - Résultats sous forme de tableau
+```{r}
+###############################################################################
+## BLOC 1 : TEST DE RACINE UNITAIRE (ADF)
+###############################################################################
+
+# Liste des variables à tester
+vars_adf <- c("exportations", "inflation", "taux_de_change", "formation_brute_capital_fixe", "aide_etr")
+
+# Conserver uniquement les variables existantes dans df_impute et ayant au moins 3 observations
+vars_adf <- Filter(function(v) {
+  v %in% names(df_impute) && length(na.omit(df_impute[[v]])) > 3
+}, vars_adf)
+
+# Application du test ADF pour chaque variable sélectionnée (en éliminant les NA)
+adf_results <- lapply(vars_adf, function(var_name) {
+  series <- na.omit(df_impute[[var_name]])
+  test_res <- adf.test(series, k = 2)  # Ajustez k si nécessaire
+  data.frame(
+    variable  = var_name,
+    statistic = test_res$statistic,
+    p_value   = test_res$p.value,
+    method    = test_res$method,
+    row.names = NULL
+  )
+})
+
+# Combinaison des résultats dans un data.frame
+adf_table <- do.call(rbind, adf_results)
+
+cat("===== Tableau ADF =====\n")
+print(adf_table)
+
+
+```
+
+
+## .Choix du retard optimal (AIC) pour le modèle ARDL
+```{r}
+# ----- Bloc 2 : Sélection du retard optimal (AIC) -----
+
+# Construction de la formule ARDL :
+# Variable dépendante : exportations
+# Variables explicatives : inflation, taux_de_change, formation_brute_capital_fixe, aide_etr
+ardl_formula <- exportations ~ inflation + taux_de_change + formation_brute_capital_fixe + aide_etr
+
+# Sélection automatique du modèle ARDL (avec max_order = 4)
+model_select <- auto_ardl(
+  formula   = ardl_formula,
+  data      = df_impute,
+  max_order = 4
+)
+
+# Extraction du tableau des top orders qui contient la valeur AIC et les retards pour chaque variable
+top_orders <- model_select$top_orders
+
+# Combinaison des colonnes de retard (toutes sauf "AIC") en une chaîne de caractères
+if (!is.null(top_orders)) {
+  lag_combination <- apply(top_orders[, setdiff(names(top_orders), "AIC")], 1, paste, collapse = ", ")
+  result_table <- data.frame(AIC = top_orders$AIC, Lag = lag_combination)
+  
+  cat("\n===== Tableau de sélection des retards (AIC et Lag) =====\n")
+  print(result_table)
+} else {
+  cat("Aucune information de retards disponible.\n")
+}
+
+# Récupération de la meilleure combinaison de retards
+best_order <- model_select$best_order
+if (length(best_order) > 0 && is.null(best_order[[1]])) {
+  best_order <- best_order[-1]
+}
+
+
+```
+
+## .Estimation du modèle ARDL (en utilisant les retards optimaux trouvés)
+
+```{r}
+# ----- Bloc 3 : Estimation du modèle ARDL -----
+
+# Estimation du modèle ARDL avec la formule et la meilleure combinaison de retards trouvée
+model_ardl <- ardl(
+  formula = ardl_formula,
+  data    = df_impute,
+  order   = best_order
+)
+
+# Récupération du résumé du modèle et extraction des coefficients sous forme de data.frame
+ardl_summary <- summary(model_ardl)
+estimation_table <- as.data.frame(ardl_summary$coefficients)
+
+cat("\n===== Tableau des coefficients du modèle ARDL =====\n")
+print(estimation_table)
+
+
+
+```
+
+## .Test de Bounds (Pesaran, Shin, Smith) - Résultats sous forme de tableau
+```{r}
+# ----- Bloc 4 : Test de Bounds -----
+
+# Exécution du test de bounds avec case = 3 (intercept non restreint, pas de tendance)
+# et alpha = 0.05 pour obtenir les bornes critiques asymptotiques
+bounds_test <- bounds_f_test(model_ardl, case = 3, alpha = 0.05)
+
+# Si les bornes critiques ne sont pas disponibles, on les attribue manuellement (exemple pour alpha = 0.05)
+if (is.null(bounds_test$critical_values)) {
+  crit_lower_5 <- 2.79  # borne inférieure I(0)
+  crit_upper_5 <- 3.67  # borne supérieure I(1)
+} else {
+  crit_lower_5 <- bounds_test$critical_values[3, 1]
+  crit_upper_5 <- bounds_test$critical_values[3, 2]
+}
+
+# Récupération de la statistique F
+f_stat <- bounds_test$statistic
+
+# Comparaison de la statistique F aux bornes critiques
+comparison <- if (f_stat < crit_lower_5) {
+  paste("F (", round(f_stat, 2), ") < I(0) (", crit_lower_5, "): pas de co-intégration", sep = "")
+} else if (f_stat > crit_upper_5) {
+  paste("F (", round(f_stat, 2), ") > I(1) (", crit_upper_5, "): co-intégration établie", sep = "")
+} else {
+  paste("F (", round(f_stat, 2), ") entre I(0) (", crit_lower_5, ") et I(1) (", crit_upper_5, "): résultat incertain", sep = "")
+}
+
+# Création du tableau récapitulatif du test de Bounds
+bounds_table <- data.frame(
+  Parameter = c("F_statistic", "Crit. Val (5%) - I(0)", "Crit. Val (5%) - I(1)", "Conclusion"),
+  Value     = c(f_stat, crit_lower_5, crit_upper_5, comparison)
+)
+
+cat("\n===== Tableau du test de Bounds =====\n")
+print(bounds_table)
+
+
+
+```
+
+## .Test de normalité des résidus (Jarque-Bera) - Tableau
+```{r}
+
+# ----- Bloc 5 : Test de normalité (Jarque-Bera) -----
+
+# Extraction des résidus du modèle ARDL
+residus <- residuals(model_ardl)
+
+# Réalisation du test Jarque-Bera (via le package tseries)
+jb_test <- jarque.bera.test(residus)
+
+# Création du tableau du test
+jb_table <- data.frame(
+  JB_Statistic = jb_test$statistic,
+  p_value      = jb_test$p.value
+)
+
+cat("\n===== Tableau du test de normalité (Jarque-Bera) =====\n")
+print(jb_table)
+
+
+
+
+```
+
+## .Test de stabilité (CUSUM et CUSUM of Squares) - Tableau
+```{r}
+# ----- Bloc 6 : Test de stabilité (CUSUM et Rec-MOSUM) -----
+
+# Récupération de la formule "linéaire" du modèle ARDL
+if (!is.null(model_ardl$lm)) {
+  model_formula <- formula(model_ardl$lm)
+} else if (!is.null(model_ardl$full_formula)) {
+  model_formula <- model_ardl$full_formula
+} else if (!is.null(model_ardl$call$formula)) {
+  model_formula <- model_ardl$call$formula
+} else {
+  stop("Impossible de récupérer la formule du modèle ARDL.")
+}
+
+# Assurer que l'environnement de la formule est correct
+environment(model_formula) <- .GlobalEnv
+
+# Application du test de stabilité : CUSUM (Rec-CUSUM)
+cusum_test_obj <- efp(model_formula, data = df_impute, type = "Rec-CUSUM")
+cusum_test_res <- sctest(cusum_test_obj)
+
+# Application du test de stabilité : Rec-MOSUM (remplaçant Rec-CUSUM2)
+cusum_sq_test_obj <- efp(model_formula, data = df_impute, type = "Rec-MOSUM")
+cusum_sq_test_res <- sctest(cusum_sq_test_obj)
+
+# Compilation des résultats dans un tableau
+stability_table <- data.frame(
+  Test      = c("CUSUM", "Rec-MOSUM"),
+  Statistic = c(cusum_test_res$statistic, cusum_sq_test_res$statistic),
+  p_value   = c(cusum_test_res$p.value,   cusum_sq_test_res$p.value)
+)
+
+cat("\n===== Tableau des tests de stabilité =====\n")
+print(stability_table)
+
+```
+
+
+
+
+
