@@ -23,7 +23,7 @@ The goal is to uncover both short-run and long-run relationships and provide pol
 ---
 
 ## 🎯 Key Objectives
-1. **Clean & load** a compact macro-panel stored in `data/economic_indicators_mauritania.xlsx`.  
+1. **Clean & load** a compact macro-panel stored in `data.xlsx`.  
 2. **Specify & estimate** individual ARDL(p,q) equations for each demand component.  
 3. **Perform**  
    * ADF / PP unit-root tests  
